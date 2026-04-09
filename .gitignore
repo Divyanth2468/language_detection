@@ -1,0 +1,40 @@
+root:rootpassword@tcp(127.0.0.1:3306)/lykStage
+n ─────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env/
+.env.*
+
+# ── Logs ───────────────────────────────
+logs/
+*.log
+
+# ── Output / temp data ─────────────────
+output/
+temp/
+*.csv
+*.wav
+*.ts
+
+# ── OS files ───────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE / Editor ───────────────────────
+.vscode/
+.idea/
+
+# ── Type checking / tooling ────────────
+.pyright/
+.pyrightconfig.json
+
+# ── Misc ───────────────────────────────
+*.sqlite3
+
+pyrightconfig.json
+

@@ -1,0 +1,25 @@
+# Build tools — pinned below 82 because torch 2.x requires setuptools<82
+setuptools>=68.0.0,<82
+wheel>=0.41.0
+
+# PyTorch (CPU) — works on all Macs including Apple Silicon
+torch>=2.0.0
+
+# Whisper dependencies (installed separately in setup.sh via git)
+# openai-whisper is NOT listed here to avoid the pkg_resources build error
+numpy<2.0          # whisper requires numpy 1.x
+more-itertools
+tiktoken>=0.3.1
+numba
+
+# HTTP + M3U8 parsing
+requests==2.31.0
+m3u8==3.5.0
+
+# Audio/video processing (Python bindings for ffmpeg)
+ffmpeg-python==0.2.0
+
+# Data + utilities
+pandas==2.1.4
+tqdm==4.66.1
+python-dotenv==1.0.0
