@@ -45,15 +45,6 @@ python export_csv.py --output output/results.csv
 
 ---
 
-## Performance
-
-- Sequential: ~6–10 seconds per video
-- Parallel: ~1–2 seconds per video
-
-Parallel processing significantly reduces total runtime for large datasets.
-
----
-
 ## Configuration
 
 Edit `config.py`:
