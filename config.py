@@ -30,6 +30,9 @@ WHISPER_MODEL_DESCRIPTIONS = {
     "large": "Best accuracy, slowest   (~10 GB VRAM)",
 }
 
+# --- Workers
+WORKER_COUNT = 10
+
 # ── Sampling ───────────────────────────────────────────────────────────────
 TS_SAMPLE_COUNT: int = int(os.getenv("TS_SAMPLE_COUNT", 10))
 AUDIO_CLIP_SECONDS: int = 120

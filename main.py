@@ -22,7 +22,13 @@ import logging
 import sys
 from pathlib import Path
 
-from config import OUTPUT_CSV, TS_SAMPLE_COUNT, WHISPER_MODEL, WHISPER_MODELS
+from config import (
+    OUTPUT_CSV,
+    TS_SAMPLE_COUNT,
+    WHISPER_MODEL,
+    WHISPER_MODELS,
+    WORKER_COUNT,
+)
 from src.exporter import print_summary
 from src.pipeline import process_queue_parallel, process_url, process_urls
 
@@ -56,6 +62,7 @@ def _parse_args():
     p.add_argument("--model", "-m", default=WHISPER_MODEL, choices=WHISPER_MODELS)
     p.add_argument("--samples", "-s", type=int, default=TS_SAMPLE_COUNT)
     p.add_argument("--output", "-o", type=Path, default=OUTPUT_CSV)
+    p.add_argument("--workers", "-w", type=int, default=WORKER_COUNT)
     p.add_argument(
         "--no-db",
         action="store_true",
@@ -87,7 +94,7 @@ def main() -> int:
             sample_count=args.samples,
             model_size=args.model,
             output_path=args.output,
-            max_workers=10,
+            max_workers=args.workers,
         )
 
     elif args.url:

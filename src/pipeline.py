@@ -15,7 +15,13 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import AUDIO_CLIP_SECONDS, OUTPUT_CSV, TS_SAMPLE_COUNT, WHISPER_MODEL
-from src.db_writer import export_mismatched_to_csv, get_queue, write_error, write_result
+from src.db_writer import (
+    export_mismatched_to_csv,
+    get_queue,
+    mark_processed_bulk,
+    write_error,
+    write_result,
+)
 from src.detector import detect_language
 from src.exporter import write_error as csv_error
 from src.exporter import write_result as csv_write
@@ -175,13 +181,13 @@ def process_queue(
 
             logger.info("[4/4] Writing results …")
 
-            db_write(
+            write_result(
                 event_id=event_id,
                 cdn_url=cdn_url,
                 current_lang_ids=current_lang_ids,
                 current_lang_names=lang_names,
                 detected_lang=detection.language_code,
-                detected_lang_id=detected_lang_id,
+                detected_lang_id=whisper_code_to_lang_id(detection.language_code) or 0,
                 detected_lang_name=detection.language_name,
                 confidence=detection.confidence,
                 lang_match_status=lang_match_status,
@@ -213,7 +219,7 @@ def process_queue(
             elapsed = time.perf_counter() - start
             logger.error(f"❌  event_id={event_id} failed ({elapsed:.1f}s): {exc}")
 
-            db_error(
+            write_error(
                 event_id=event_id,
                 error=str(exc),
                 cdn_url=cdn_url,
@@ -233,7 +239,8 @@ def process_queue(
             cleanup_ts_files(ts_files)
             if wav_path and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
-
+    processed_ids = [r["event_id"] for r in results if r.get("event_id")]
+    mark_processed_bulk(processed_ids)
     export_mismatched_to_csv(output_path)
 
     return results
@@ -350,6 +357,9 @@ def process_queue_parallel(
                 logger.error(f"Worker crashed: {e}")
 
     print("\n✅ Parallel queue processing complete.\n")
+    # Collect all processed event_ids
+    processed_ids = [r["event_id"] for r in results if r.get("event_id")]
+    mark_processed_bulk(processed_ids)
 
     # EXPORT AFTER EVERYTHING IS DONE
     export_mismatched_to_csv(output_path)

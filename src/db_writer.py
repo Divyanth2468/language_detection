@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS detection_queue (
     current_lang_ids JSON,
     current_lang_names TEXT,
     queued_at        DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    processed        TINYINT DEFAULT 0,
     UNIQUE KEY uq_event (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
@@ -81,6 +82,7 @@ def enqueue_video(
                 cdn_url            = VALUES(cdn_url),
                 current_lang_ids   = VALUES(current_lang_ids),
                 current_lang_names = VALUES(current_lang_names),
+                processed = 0,
                 queued_at          = VALUES(queued_at)
         """,
             {
@@ -97,7 +99,9 @@ def get_queue() -> list[dict]:
     """Return all rows from detection_queue."""
     ensure_tables()
     with _cursor() as cur:
-        cur.execute("SELECT * FROM detection_queue ORDER BY queued_at ASC")
+        cur.execute(
+            "SELECT * FROM detection_queue WHERE processed = 0 ORDER BY queued_at ASC"
+        )
         return cur.fetchall()
 
 
@@ -204,6 +208,12 @@ def bulk_enqueue_videos(rows):
         current_lang_names
     )
     VALUES (%s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+        cdn_url = VALUES(cdn_url),
+        current_lang_ids = VALUES(current_lang_ids),
+        current_lang_names = VALUES(current_lang_names),
+        processed = 0,
+        queued_at = CURRENT_TIMESTAMP
     """
 
     with _cursor() as cur:
@@ -234,6 +244,7 @@ def export_mismatched_to_csv(output_path: Path):
     FROM detection_results
     WHERE lang_match_status = 'mismatch'
       AND status = 'ok'
+      AND detected_lang_id > 0
     ORDER BY processed_at DESC
     """
 
@@ -251,3 +262,24 @@ def export_mismatched_to_csv(output_path: Path):
         writer.writerows(rows)
 
     print(f"✅ Exported {len(rows)} mismatched rows to {output_path}")
+
+
+def mark_processed_bulk(event_ids: list[str]):
+    if not event_ids:
+        return
+
+    CHUNK_SIZE = 500
+
+    with _cursor() as cur:
+        for i in range(0, len(event_ids), CHUNK_SIZE):
+            chunk = event_ids[i : i + CHUNK_SIZE]
+
+            query = f"""
+            UPDATE detection_queue
+            SET processed = 1
+            WHERE event_id IN ({','.join(['%s'] * len(chunk))})
+            """
+
+            cur.execute(query, chunk)
+
+    logger.info(f"Marked {len(event_ids)} rows as processed")
