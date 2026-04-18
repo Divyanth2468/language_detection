@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _CREATE_QUEUE = """
 CREATE TABLE IF NOT EXISTS detection_queue (
     id               INT AUTO_INCREMENT PRIMARY KEY,
-    event_id         VARCHAR(64)  NOT NULL,
+    event_id         BIGINT NOT NULL,
     cdn_url          TEXT,
     current_lang_ids JSON,
     current_lang_names TEXT,
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS detection_queue (
 _CREATE_RESULTS = """
 CREATE TABLE IF NOT EXISTS detection_results (
     id                   INT AUTO_INCREMENT PRIMARY KEY,
-    event_id             VARCHAR(64)  NOT NULL,
+    event_id             BIGINT NOT NULL,
     cdn_url              TEXT,
     current_lang_ids     JSON,
     current_lang_names   TEXT,
