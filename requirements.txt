@@ -3,23 +3,52 @@ setuptools>=68.0.0,<82
 wheel>=0.41.0
 
 # PyTorch (CPU) — works on all Macs including Apple Silicon
-torch>=2.0.0
+torch==2.11.0
 
-# Whisper dependencies (installed separately in setup.sh via git)
-# openai-whisper is NOT listed here to avoid the pkg_resources build error
-numpy<2.0          # whisper requires numpy 1.x
-more-itertools
-tiktoken>=0.3.1
-numba
+# Whisper (installed from source to avoid pkg_resources build error)
+openai-whisper @ git+https://github.com/openai/whisper.git@cba3768142a28276a90f14907e4900372c0c3ee0
+
+# Whisper dependencies
+numpy==1.26.4
+more-itertools==10.8.0
+tiktoken==0.12.0
+numba==0.65.0
+llvmlite==0.47.0
 
 # HTTP + M3U8 parsing
 requests==2.31.0
 m3u8==3.5.0
+certifi==2026.2.25
+charset-normalizer==3.4.6
+idna==3.11
+urllib3==2.6.3
 
-# Audio/video processing (Python bindings for ffmpeg)
+# Audio/video processing
 ffmpeg-python==0.2.0
+future==1.0.0
+
+# Database
+PyMySQL==1.1.2
 
 # Data + utilities
 pandas==2.1.4
 tqdm==4.66.1
 python-dotenv==1.0.0
+dotenv==0.9.9
+python-dateutil==2.9.0.post0
+pytz==2026.1.post1
+tzdata==2025.3
+six==1.17.0
+iso8601==2.1.0
+packaging==26.0
+regex==2026.3.32
+
+# PyTorch internals
+filelock==3.25.2
+fsspec==2026.3.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+sympy==1.14.0
+typing_extensions==4.15.0

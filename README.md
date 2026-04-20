@@ -1,6 +1,26 @@
-# M3U8 Language Mapper
+# M3U8 Language Mapper (v2)
 
-Detects the spoken language in M3U8 HLS streams using Whisper, processes videos in parallel, and exports results to CSV.
+Detect spoken language from M3U8 (HLS) video streams using Whisper, with:
+
+- DB-backed queue processing
+- Parallel workers
+- Dialect-aware matching
+- Structured result storage (MySQL)
+- CSV export (dashboard-ready)
+
+---
+
+## What This System Does
+
+1. Fetches videos from DB (`lyk_events + video_set`)
+2. Queues them into `detection_queue`
+3. Samples TS segments from M3U8
+4. Extracts audio via FFmpeg
+5. Detects language using Whisper
+6. Maps to internal `languageMaster` IDs
+7. Compares with existing tags
+8. Stores results in DB
+9. Exports mismatches to CSV
 
 ---
 
@@ -9,92 +29,230 @@ Detects the spoken language in M3U8 HLS streams using Whisper, processes videos 
 ```
 language_mapping/
 ├── src/
-│   ├── fetcher.py
-│   ├── processor.py
-│   ├── detector.py
-│   ├── exporter.py
-│   ├── db.py
-│   ├── db_writer.py
-│   ├── lang_utils.py
-│   └── pipeline.py
-├── output/
-├── temp/
-├── logs/
-├── config.py
-├── fetch_urls.py
-├── main.py
-├── export_csv.py
-├── requirements.txt
-└── setup.sh
+│   ├── pipeline.py        # Orchestration (queue + parallel processing)
+│   ├── fetcher.py         # M3U8 parsing + TS download
+│   ├── processor.py       # FFmpeg merge + audio extraction
+│   ├── detector.py        # Whisper language detection
+│   ├── lang_utils.py      # Language mapping + match logic
+│   ├── db.py              # DB read queries
+│   ├── db_writer.py       # Queue + results table writes
+│   └── exporter.py        # CSV writer (URL mode)
+│
+├── main.py                # Entry point
+├── fetch_urls.py          # Load videos into queue
+├── export_csv.py          # Export DB results to CSV
+├── config.py              # All configs
+│
+├── output/                # CSV outputs
+├── temp/                  # TS + WAV temp files
+├── logs/                  # Logs
 ```
+
+---
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+bash setup.sh
+```
+
+### Requirements
+
+- Python 3.10+
+- FFmpeg installed
+- MySQL access
+- 2–6 GB RAM (depending on Whisper model)
+
+---
+
+## Database Tables
+
+### 1. `detection_queue`
+
+| Column           | Description            |
+| ---------------- | ---------------------- |
+| event_id         | Video ID               |
+| cdn_url          | M3U8 URL               |
+| current_lang_ids | Existing language tags |
+| processed        | 0 = pending, 1 = done  |
+
+### 2. `detection_results`
+
+Stores final detection output:
+
+- detected_lang (ISO)
+- detected_lang_id (internal)
+- confidence
+- lang_match_status
+- whisper_model
+- error (if any)
 
 ---
 
 ## Workflow
 
+### Step 1 — Load videos into queue
+
 ```bash
-# Step 1 — Load videos into queue
 python fetch_urls.py --from 2026-01-01 --to 2026-03-31
+```
 
-# Step 2 — Process queue
+Other modes:
+
+```bash
+python fetch_urls.py --all
+python fetch_urls.py --event-id 295134
+```
+
+### Step 2 — Process queue (parallel)
+
+```bash
 python main.py --queue
+```
 
-# Step 3 — Export results
+Options:
+
+```bash
+python main.py --queue --workers 10
+python main.py --queue --model medium
+python main.py --queue --no-db   # CSV only
+```
+
+### Step 3 — Export results
+
+```bash
 python export_csv.py --output output/results.csv
+```
+
+Filters:
+
+```bash
+--from 2026-01-01
+--to 2026-03-31
+--status mismatch
 ```
 
 ---
 
-## Configuration
+## Testing Modes (No DB)
 
-Edit `config.py`:
+### Single URL
 
-```python
-WHISPER_MODEL = "small"   # or "medium"
-TS_SAMPLE_COUNT = 10
-AUDIO_CLIP_SECONDS = 90
+```bash
+python main.py --url "https://..."
+```
+
+### Batch URLs
+
+```bash
+python main.py --input urls.txt
 ```
 
 ---
 
 ## Parallel Processing
 
-Configured in the pipeline:
+Controlled via:
 
 ```python
-process_queue_parallel(max_workers=6)
+process_queue_parallel(max_workers=10)
 ```
 
-Adjust `max_workers` based on your system.
+Each worker:
+
+- Downloads segments
+- Extracts audio
+- Runs Whisper
+
+Thread-safe model loading and per-video temp isolation are handled automatically.
 
 ---
 
-## Output
+## Language Detection Logic
 
-CSV includes:
+### Whisper to Internal Mapping
+
+ISO codes are mapped to `languageMaster` IDs. Examples:
+
+- `hi` → 7 (Hindi)
+- `te` → 22 (Telugu)
+
+### Match Status
+
+| Status        | Meaning                    |
+| ------------- | -------------------------- |
+| match         | Exact language match       |
+| dialect_match | Dialect resolved to parent |
+| mismatch      | Different language         |
+| untagged      | No language tag in DB      |
+| unmapped      | Whisper lang not mapped    |
+| error         | Processing failed          |
+
+---
+
+## Dialect Handling
+
+Whisper cannot detect some Indian dialects, so the following mappings are applied:
+
+| Dialect  | Mapped To     |
+| -------- | ------------- |
+| Bhojpuri | Hindi         |
+| Maithili | Hindi         |
+| Dogri    | Hindi         |
+| Sindhi   | Urdu          |
+| Meitei   | Not supported |
+| Santali  | Not supported |
+
+---
+
+## Output (CSV)
+
+Columns:
 
 - event_id
 - cdn_url
-- detected language
-- language name
+- current_lang_ids
+- current_lang_names
+- detected_lang
+- detected_lang_id
+- detected_lang_name
 - confidence
-- match status
+- lang_match_status
+- whisper_model
+- ts_sampled
+- audio_duration_s
+- status
+- error
+- processed_at
 
 ---
 
-## Notes
+## Key Features
 
-- Better accuracy with `small` or `medium` models
-- Very short audio clips may reduce accuracy
-- Some languages may be mapped to a default value if unsupported
+- Parallel processing for large-scale throughput
+- Smart TS sampling (not naive random)
+- Dialect-aware matching logic
+- Idempotent queue (re-runnable without duplicates)
+- Dual output: DB and CSV
+- Thread-safe Whisper model loading
+- Automatic temp file cleanup
+- Mismatch export for QA review
+
+---
+
+## Limitations
+
+- Whisper language detection uses a ~30s audio window
+- Very short or silent videos may yield low confidence scores
+- Some dialects are unsupported by Whisper
+- FFmpeg is a hard dependency
+- GPU recommended for large Whisper models
 
 ---
 
 ## Summary
 
-- Queue-based processing using database
-- Parallel execution for faster throughput
-- Whisper-based language detection
-- CSV export for reporting
+This is a production-ready pipeline:
 
----
+**DB → Queue → Parallel Processing → Detection → Validation → Storage → Export**
