@@ -222,6 +222,19 @@ def bulk_enqueue_videos(rows):
     logger.info(f"Bulk inserted {len(rows)} rows into detection_queue")
 
 
+ALPHA_ARR = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+ALPHA_ARR_REV = ["Z", "Y", "X", "W", "V", "U", "T", "S", "R", "Q"]
+BASE_URL = "https://lykstage.com"
+
+
+def _encrypt_video_url(event_id) -> str:
+    encoded = ""
+    for ch in str(event_id):
+        idx = int(ch)
+        encoded += ALPHA_ARR[idx] + ALPHA_ARR_REV[idx] + ch
+    return BASE_URL + "/l/" + encoded
+
+
 def export_mismatched_to_csv(output_path: Path):
     import csv
 
@@ -247,21 +260,27 @@ def export_mismatched_to_csv(output_path: Path):
       AND detected_lang_id > 0
     ORDER BY processed_at DESC
     """
-
     with _cursor() as cur:
         cur.execute(query)
         rows = cur.fetchall()
-
     if not rows:
         print("No mismatched rows found.")
         return
 
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
+    fieldnames = list(rows[0].keys()) + ["video_link"]
 
-    print(f"✅ Exported {len(rows)} mismatched rows to {output_path}")
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            row = dict(row)
+            try:
+                row["video_link"] = _encrypt_video_url(row["event_id"])
+            except (ValueError, KeyError):
+                row["video_link"] = ""
+            writer.writerow(row)
+
+    print(f"Exported {len(rows)} mismatched rows to {output_path}")
 
 
 def mark_processed_bulk(event_ids: list[str]):
