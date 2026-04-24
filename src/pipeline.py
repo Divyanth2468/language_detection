@@ -1,7 +1,13 @@
 """
 src/pipeline.py
 ───────────────
-Orchestrates: fetch → merge → extract audio → detect → write DB + CSV.
+Orchestrates: fetch → merge → extract audio → VAD → detect → write DB + CSV.
+
+VAD gate:
+  - get_speech_ratio() is called after audio extraction
+  - If speech_ratio < SPEECH_RATIO_THRESHOLD (0.15), Whisper is skipped entirely
+  - Result is written with lang_match_status="no_speech" and error="VAD: no speech detected"
+  - This prevents false language detections on music-only or silent videos
 """
 
 import logging
@@ -14,7 +20,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from config import AUDIO_CLIP_SECONDS, OUTPUT_CSV, TS_SAMPLE_COUNT, WHISPER_MODEL
+from config import (
+    AUDIO_CLIP_SECONDS,
+    OUTPUT_CSV,
+    SPEECH_RATIO_THRESHOLD,
+    TS_SAMPLE_COUNT,
+    WHISPER_MODEL,
+)
 from src.db_writer import (
     export_mismatched_to_csv,
     get_queue,
@@ -31,7 +43,7 @@ from src.lang_utils import (
     resolve_match_status,
     whisper_code_to_lang_id,
 )
-from src.processor import cleanup_ts_files, merge_and_extract_audio
+from src.processor import cleanup_ts_files, get_speech_ratio, merge_and_extract_audio
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +75,39 @@ def process_url(
         logger.info("[2/4] Merging TS + extracting audio …")
         wav_path = merge_and_extract_audio(ts_files)
 
-        logger.info("[3/4] Detecting language …")
-        result = detect_language(wav_path, model_size=model_size)
+        logger.info("[3/4] VAD check …")
+        speech_ratio = get_speech_ratio(wav_path)
+        logger.info(
+            f"speech_ratio={speech_ratio:.3f} (threshold={SPEECH_RATIO_THRESHOLD})"
+        )
 
-        logger.info("[4/4] Writing CSV …")
+        if speech_ratio < SPEECH_RATIO_THRESHOLD:
+            logger.info("Skipping Whisper — no speech detected (music/silent content)")
+            csv_write(
+                url=url,
+                language_code="",
+                language_name="",
+                confidence=0.0,
+                model_used=model_size,
+                ts_sampled=len(ts_files),
+                audio_duration=AUDIO_CLIP_SECONDS,
+                status="ok",
+                error="VAD: no speech detected",
+                output_path=output_path,
+            )
+            elapsed = time.perf_counter() - start
+            logger.info(
+                f"⏭️  Skipped in {elapsed:.1f}s — speech_ratio={speech_ratio:.3f}"
+            )
+            return {
+                "url": url,
+                "status": "ok",
+                "skip_reason": "no_speech",
+                "speech_ratio": speech_ratio,
+            }
+
+        logger.info("[4/4] Detecting language …")
+        result = detect_language(wav_path, model_size=model_size)
 
         csv_write(
             url=url,
@@ -82,7 +123,8 @@ def process_url(
         logger.info(
             f"✅  Done in {elapsed:.1f}s — "
             f"Language: {result.language_name} ({result.language_code}), "
-            f"Confidence: {result.confidence:.3f}"
+            f"Confidence: {result.confidence:.3f}, "
+            f"speech_ratio={speech_ratio:.3f}"
         )
         return {
             "url": url,
@@ -90,6 +132,7 @@ def process_url(
             "language_code": result.language_code,
             "language_name": result.language_name,
             "confidence": result.confidence,
+            "speech_ratio": speech_ratio,
             "error": "",
         }
 
@@ -127,15 +170,13 @@ def process_queue(
     output_path: Path = OUTPUT_CSV,
 ) -> list[dict]:
     """
-    Reads detection_queue, processes each video,
+    Reads detection_queue, processes each video sequentially,
     writes results to detection_results table + CSV.
     """
     rows = get_queue()
     if not rows:
         logger.info("detection_queue is empty. Run fetch_urls.py first.")
         return []
-
-    import json
 
     results = []
     total = len(rows)
@@ -145,7 +186,6 @@ def process_queue(
         cdn_url = row["cdn_url"] or ""
         lang_names = row["current_lang_names"] or ""
 
-        # Parse JSON array from DB
         raw_ids = row.get("current_lang_ids")
         if isinstance(raw_ids, str):
             try:
@@ -172,14 +212,42 @@ def process_queue(
             logger.info("[2/4] Merging TS + extracting audio …")
             wav_path = merge_and_extract_audio(ts_files)
 
-            logger.info("[3/4] Detecting language …")
+            logger.info("[3/4] VAD check …")
+            speech_ratio = get_speech_ratio(wav_path)
+            logger.info(
+                f"[{event_id}] speech_ratio={speech_ratio:.3f} (threshold={SPEECH_RATIO_THRESHOLD})"
+            )
+
+            if speech_ratio < SPEECH_RATIO_THRESHOLD:
+                logger.info(f"[{event_id}] Skipping Whisper — no speech detected")
+                write_result(
+                    event_id=event_id,
+                    cdn_url=cdn_url,
+                    current_lang_ids=current_lang_ids,
+                    current_lang_names=lang_names,
+                    detected_lang="",
+                    detected_lang_id=0,
+                    detected_lang_name="",
+                    confidence=0.0,
+                    lang_match_status="no_speech",
+                    whisper_model=model_size,
+                    ts_sampled=len(ts_files),
+                    audio_duration_s=AUDIO_CLIP_SECONDS,
+                    status="ok",
+                    error="VAD: no speech detected",
+                )
+                elapsed = time.perf_counter() - start
+                logger.info(f"⏭️  [{event_id}] Skipped in {elapsed:.1f}s")
+                results.append(
+                    {"event_id": event_id, "status": "ok", "skip_reason": "no_speech"}
+                )
+                continue
+
+            logger.info("[4/4] Detecting language …")
             detection = detect_language(wav_path, model_size=model_size)
 
-            # Resolve IDs and match status
             detected_lang_id = whisper_code_to_lang_id(detection.language_code)
             lang_match_status = resolve_match_status(current_lang_ids, detected_lang_id)
-
-            logger.info("[4/4] Writing results …")
 
             write_result(
                 event_id=event_id,
@@ -201,7 +269,8 @@ def process_queue(
             logger.info(
                 f"✅  Done in {elapsed:.1f}s — "
                 f"{detection.language_name}({detected_lang_id}) "
-                f"status={lang_match_status} conf={detection.confidence:.3f}"
+                f"status={lang_match_status} conf={detection.confidence:.3f} "
+                f"speech_ratio={speech_ratio:.3f}"
             )
 
             results.append(
@@ -218,7 +287,6 @@ def process_queue(
         except Exception as exc:
             elapsed = time.perf_counter() - start
             logger.error(f"❌  event_id={event_id} failed ({elapsed:.1f}s): {exc}")
-
             write_error(
                 event_id=event_id,
                 error=str(exc),
@@ -226,19 +294,13 @@ def process_queue(
                 current_lang_ids=current_lang_ids,
                 current_lang_names=lang_names,
             )
-
-            results.append(
-                {
-                    "event_id": event_id,
-                    "status": "error",
-                    "error": str(exc),
-                }
-            )
+            results.append({"event_id": event_id, "status": "error", "error": str(exc)})
 
         finally:
             cleanup_ts_files(ts_files)
             if wav_path and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
+
     processed_ids = [r["event_id"] for r in results if r.get("event_id")]
     mark_processed_bulk(processed_ids)
     export_mismatched_to_csv(output_path)
@@ -253,9 +315,10 @@ def process_queue_parallel(
     max_workers: int = 8,
 ):
     """
-    Parallel version of queue processor (DB + CSV)
+    Parallel version of queue processor (DB + CSV).
+    VAD runs per-worker before Whisper — Silero model is shared (loaded once).
+    Whisper inference is serialized via _infer_lock in detector.py.
     """
-
     queue = get_queue()
 
     if not queue:
@@ -272,7 +335,6 @@ def process_queue_parallel(
         cdn_url = row["cdn_url"] or ""
         lang_names = row.get("current_lang_names") or ""
 
-        # Parse JSON safely
         raw_ids = row.get("current_lang_ids")
         if isinstance(raw_ids, str):
             try:
@@ -295,12 +357,42 @@ def process_queue_parallel(
             )
             wav_path = merge_and_extract_audio(ts_files)
 
+            # ── VAD gate ───────────────────────────────────────────────────
+            speech_ratio = get_speech_ratio(wav_path)
+            logger.info(
+                f"[{event_id}] speech_ratio={speech_ratio:.3f} (threshold={SPEECH_RATIO_THRESHOLD})"
+            )
+
+            if speech_ratio < SPEECH_RATIO_THRESHOLD:
+                logger.info(f"[{event_id}] Skipping Whisper — no speech detected")
+                write_result(
+                    event_id=event_id,
+                    cdn_url=cdn_url,
+                    current_lang_ids=current_lang_ids,
+                    current_lang_names=lang_names,
+                    detected_lang="",
+                    detected_lang_id=0,
+                    detected_lang_name="",
+                    confidence=0.0,
+                    lang_match_status="no_speech",
+                    whisper_model=model_size,
+                    ts_sampled=len(ts_files),
+                    audio_duration_s=AUDIO_CLIP_SECONDS,
+                    status="ok",
+                    error="VAD: no speech detected",
+                )
+                return {
+                    "event_id": event_id,
+                    "status": "ok",
+                    "skip_reason": "no_speech",
+                }
+            # ──────────────────────────────────────────────────────────────
+
             detection = detect_language(wav_path, model_size=model_size)
 
             detected_lang_id = whisper_code_to_lang_id(detection.language_code) or 0
             lang_match_status = resolve_match_status(current_lang_ids, detected_lang_id)
 
-            # DB write
             write_result(
                 event_id=event_id,
                 cdn_url=cdn_url,
@@ -317,16 +409,16 @@ def process_queue_parallel(
                 status="ok",
             )
 
-            logger.info(f"[{idx}/{total}] DONE event_id={event_id}")
+            logger.info(
+                f"[{idx}/{total}] DONE event_id={event_id} — "
+                f"{detection.language_name}({detected_lang_id}) "
+                f"conf={detection.confidence:.3f} speech_ratio={speech_ratio:.3f}"
+            )
 
-            return {
-                "event_id": event_id,
-                "status": "ok",
-            }
+            return {"event_id": event_id, "status": "ok"}
 
         except Exception as e:
             logger.error(f"[{idx}/{total}] ERROR event_id={event_id}: {e}")
-
             write_error(
                 event_id=event_id,
                 error=str(e),
@@ -334,22 +426,15 @@ def process_queue_parallel(
                 current_lang_ids=current_lang_ids,
                 current_lang_names=lang_names,
             )
-
-            return {
-                "event_id": event_id,
-                "status": "error",
-                "error": str(e),
-            }
+            return {"event_id": event_id, "status": "error", "error": str(e)}
 
         finally:
             cleanup_ts_files(ts_files)
             if wav_path and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
 
-    # Parallel execution
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(worker, row, i) for i, row in enumerate(queue, 1)]
-
         for f in as_completed(futures):
             try:
                 results.append(f.result())
@@ -357,11 +442,9 @@ def process_queue_parallel(
                 logger.error(f"Worker crashed: {e}")
 
     print("\n✅ Parallel queue processing complete.\n")
-    # Collect all processed event_ids
+
     processed_ids = [r["event_id"] for r in results if r.get("event_id")]
     mark_processed_bulk(processed_ids)
-
-    # EXPORT AFTER EVERYTHING IS DONE
     export_mismatched_to_csv(output_path)
 
     return results

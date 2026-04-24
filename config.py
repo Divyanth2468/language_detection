@@ -37,6 +37,7 @@ WORKER_COUNT = 10
 TS_SAMPLE_COUNT: int = int(os.getenv("TS_SAMPLE_COUNT", 10))
 AUDIO_CLIP_SECONDS: int = 120
 AUDIO_OFFSET_SECONDS: int = 0
+SPEECH_RATIO_THRESHOLD = 0.15
 
 # ── Networking ─────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT: int = 30
