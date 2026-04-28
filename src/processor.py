@@ -27,7 +27,7 @@ WHISPER_SAMPLE_RATE = 16000
 WHISPER_CHANNELS = 1
 
 # Speech ratio below this → skip Whisper (music/silence)
-SPEECH_RATIO_THRESHOLD = 0.15
+SPEECH_RATIO_THRESHOLD = 0.1
 
 # ── VAD model cache ────────────────────────────────────────────────────────
 
@@ -190,7 +190,7 @@ def _extract_audio(source: Path, wav_out: Path) -> None:
     Extract audio from `source`, convert to 16 kHz mono WAV.
     Skips the first 10 s to avoid intros/silence, then takes AUDIO_CLIP_SECONDS.
     """
-    offset = 10  # skip first 10s (intros, silence)
+    offset = 0  # sampled segments are already mid-content
     duration = AUDIO_CLIP_SECONDS
 
     logger.info(

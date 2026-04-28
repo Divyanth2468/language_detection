@@ -97,13 +97,16 @@ def fetch_results(
             conditions.append("lang_match_status = %(sf)s")
         params["sf"] = status_filter
 
-    # Correct confidence logic
     if min_conf is not None:
-        conditions.append("confidence >= %(min_conf)s")
+        conditions.append(
+            "GREATEST(confidence, COALESCE(retry_confidence, 0)) >= %(min_conf)s"
+        )
         params["min_conf"] = min_conf
 
     if max_conf is not None:
-        conditions.append("confidence < %(max_conf)s")
+        conditions.append(
+            "GREATEST(confidence, COALESCE(retry_confidence, 0)) < %(max_conf)s"
+        )
         params["max_conf"] = max_conf
 
     query = f"""
@@ -116,6 +119,7 @@ def fetch_results(
             detected_lang_id,
             detected_lang_name,
             confidence,
+            retry_confidence,
             lang_match_status,
             whisper_model,
             ts_sampled,
@@ -168,7 +172,11 @@ def main():
             elif isinstance(raw, list):
                 row["current_lang_ids"] = json.dumps(raw)
 
-            # Add video_link at end
+            # Use the stronger confidence signal for the CSV output
+            conf = row.get("confidence") or 0.0
+            retry_conf = row.get("retry_confidence")
+            row["confidence"] = retry_conf if retry_conf is not None else conf
+
             try:
                 row["video_link"] = _encrypt_video_url(row["event_id"])
             except Exception:

@@ -23,7 +23,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import (
     AUDIO_CLIP_SECONDS,
     OUTPUT_CSV,
+    RETRY_FETCH_DELAY,
     SPEECH_RATIO_THRESHOLD,
+    TS_RETRY_SAMPLE_COUNT,
     TS_SAMPLE_COUNT,
     WHISPER_MODEL,
 )
@@ -37,7 +39,7 @@ from src.db_writer import (
 from src.detector import detect_language
 from src.exporter import write_error as csv_error
 from src.exporter import write_result as csv_write
-from src.fetcher import fetch_segments
+from src.fetcher import fetch_segments, fetch_segments_retry
 from src.lang_utils import (
     lang_ids_to_names,
     resolve_match_status,
@@ -96,9 +98,7 @@ def process_url(
                 output_path=output_path,
             )
             elapsed = time.perf_counter() - start
-            logger.info(
-                f"⏭️  Skipped in {elapsed:.1f}s — speech_ratio={speech_ratio:.3f}"
-            )
+            logger.info(f"Skipped in {elapsed:.1f}s — speech_ratio={speech_ratio:.3f}")
             return {
                 "url": url,
                 "status": "ok",
@@ -121,7 +121,7 @@ def process_url(
         )
         elapsed = time.perf_counter() - start
         logger.info(
-            f"✅  Done in {elapsed:.1f}s — "
+            f"Done in {elapsed:.1f}s — "
             f"Language: {result.language_name} ({result.language_code}), "
             f"Confidence: {result.confidence:.3f}, "
             f"speech_ratio={speech_ratio:.3f}"
@@ -138,7 +138,7 @@ def process_url(
 
     except Exception as exc:
         elapsed = time.perf_counter() - start
-        logger.error(f"❌  Failed ({elapsed:.1f}s): {exc}")
+        logger.error(f"Failed ({elapsed:.1f}s): {exc}")
         csv_error(url=url, error=str(exc), output_path=output_path)
         return {"url": url, "status": "error", "error": str(exc)}
 
@@ -200,7 +200,9 @@ def process_queue(
         logger.info(f"\n── [{i}/{total}] event_id={event_id} ──────────────")
 
         ts_files = []
+        retry_ts_files = []
         wav_path = None
+        retry_wav_path = None
         start = time.perf_counter()
 
         try:
@@ -229,6 +231,7 @@ def process_queue(
                     detected_lang_id=0,
                     detected_lang_name="",
                     confidence=0.0,
+                    retry_confidence=None,
                     lang_match_status="no_speech",
                     whisper_model=model_size,
                     ts_sampled=len(ts_files),
@@ -237,7 +240,7 @@ def process_queue(
                     error="VAD: no speech detected",
                 )
                 elapsed = time.perf_counter() - start
-                logger.info(f"⏭️  [{event_id}] Skipped in {elapsed:.1f}s")
+                logger.info(f"[{event_id}] Skipped in {elapsed:.1f}s")
                 results.append(
                     {"event_id": event_id, "status": "ok", "skip_reason": "no_speech"}
                 )
@@ -246,8 +249,54 @@ def process_queue(
             logger.info("[4/4] Detecting language …")
             detection = detect_language(wav_path, model_size=model_size)
 
-            detected_lang_id = whisper_code_to_lang_id(detection.language_code)
+            detected_lang_id = whisper_code_to_lang_id(detection.language_code) or 0
             lang_match_status = resolve_match_status(current_lang_ids, detected_lang_id)
+
+            # ── Mismatch retry ────────────────────────────────────────────
+            retry_confidence = None
+
+            if lang_match_status == "mismatch":
+                logger.info(f"[{event_id}] Mismatch on first pass — starting retry")
+
+                if RETRY_FETCH_DELAY > 0:
+                    time.sleep(RETRY_FETCH_DELAY)
+
+                try:
+                    retry_prefix = f"{event_id}_retry"
+                    retry_ts_files = fetch_segments_retry(
+                        cdn_url,
+                        sample_count=TS_RETRY_SAMPLE_COUNT,
+                        prefix=retry_prefix,
+                    )
+                    retry_wav_path = merge_and_extract_audio(ts_files + retry_ts_files)
+                    retry_detection = detect_language(
+                        retry_wav_path, model_size=model_size
+                    )
+
+                    retry_confidence = retry_detection.confidence
+                    retry_lang_id = (
+                        whisper_code_to_lang_id(retry_detection.language_code) or 0
+                    )
+                    retry_match_status = resolve_match_status(
+                        current_lang_ids, retry_lang_id
+                    )
+
+                    logger.info(
+                        f"[{event_id}] Retry result: {retry_detection.language_name}"
+                        f"({retry_lang_id}) status={retry_match_status} "
+                        f"conf={retry_confidence:.3f}"
+                    )
+
+                    # Retry result wins — overwrite detection fields
+                    detection = retry_detection
+                    detected_lang_id = retry_lang_id
+                    lang_match_status = retry_match_status
+
+                except Exception as retry_exc:
+                    logger.warning(
+                        f"[{event_id}] Retry fetch/detect failed, using first-pass result: {retry_exc}"
+                    )
+            # ─────────────────────────────────────────────────────────────
 
             write_result(
                 event_id=event_id,
@@ -255,22 +304,27 @@ def process_queue(
                 current_lang_ids=current_lang_ids,
                 current_lang_names=lang_names,
                 detected_lang=detection.language_code,
-                detected_lang_id=whisper_code_to_lang_id(detection.language_code) or 0,
+                detected_lang_id=detected_lang_id,
                 detected_lang_name=detection.language_name,
                 confidence=detection.confidence,
+                retry_confidence=retry_confidence,
                 lang_match_status=lang_match_status,
                 whisper_model=detection.model_used,
-                ts_sampled=len(ts_files),
+                ts_sampled=len(ts_files) + len(retry_ts_files),
                 audio_duration_s=AUDIO_CLIP_SECONDS,
                 status="ok",
             )
 
             elapsed = time.perf_counter() - start
             logger.info(
-                f"✅  Done in {elapsed:.1f}s — "
+                f"Done in {elapsed:.1f}s — "
                 f"{detection.language_name}({detected_lang_id}) "
-                f"status={lang_match_status} conf={detection.confidence:.3f} "
-                f"speech_ratio={speech_ratio:.3f}"
+                f"status={lang_match_status} conf={detection.confidence:.3f}"
+                + (
+                    f" retry_conf={retry_confidence:.3f}"
+                    if retry_confidence is not None
+                    else ""
+                )
             )
 
             results.append(
@@ -281,12 +335,13 @@ def process_queue(
                     "detected_lang_id": detected_lang_id,
                     "lang_match_status": lang_match_status,
                     "confidence": detection.confidence,
+                    "retry_confidence": retry_confidence,
                 }
             )
 
         except Exception as exc:
             elapsed = time.perf_counter() - start
-            logger.error(f"❌  event_id={event_id} failed ({elapsed:.1f}s): {exc}")
+            logger.error(f"event_id={event_id} failed ({elapsed:.1f}s): {exc}")
             write_error(
                 event_id=event_id,
                 error=str(exc),
@@ -297,9 +352,11 @@ def process_queue(
             results.append({"event_id": event_id, "status": "error", "error": str(exc)})
 
         finally:
-            cleanup_ts_files(ts_files)
+            cleanup_ts_files(ts_files + retry_ts_files)  # both lists, one pass
             if wav_path and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
+            if retry_wav_path and retry_wav_path.exists():
+                retry_wav_path.unlink(missing_ok=True)
 
     processed_ids = [r["event_id"] for r in results if r.get("event_id")]
     mark_processed_bulk(processed_ids)
@@ -349,7 +406,9 @@ def process_queue_parallel(
         logger.info(f"[{idx}/{total}] START event_id={event_id}")
 
         ts_files = []
+        retry_ts_files = []
         wav_path = None
+        retry_wav_path = None
 
         try:
             ts_files = fetch_segments(
@@ -357,14 +416,11 @@ def process_queue_parallel(
             )
             wav_path = merge_and_extract_audio(ts_files)
 
-            # ── VAD gate ───────────────────────────────────────────────────
             speech_ratio = get_speech_ratio(wav_path)
-            logger.info(
-                f"[{event_id}] speech_ratio={speech_ratio:.3f} (threshold={SPEECH_RATIO_THRESHOLD})"
-            )
+            logger.info(f"[{event_id}] speech_ratio={speech_ratio:.3f}")
 
             if speech_ratio < SPEECH_RATIO_THRESHOLD:
-                logger.info(f"[{event_id}] Skipping Whisper — no speech detected")
+                logger.info(f"[{event_id}] Skipping — no speech detected")
                 write_result(
                     event_id=event_id,
                     cdn_url=cdn_url,
@@ -374,6 +430,7 @@ def process_queue_parallel(
                     detected_lang_id=0,
                     detected_lang_name="",
                     confidence=0.0,
+                    retry_confidence=None,
                     lang_match_status="no_speech",
                     whisper_model=model_size,
                     ts_sampled=len(ts_files),
@@ -386,12 +443,57 @@ def process_queue_parallel(
                     "status": "ok",
                     "skip_reason": "no_speech",
                 }
-            # ──────────────────────────────────────────────────────────────
 
             detection = detect_language(wav_path, model_size=model_size)
-
             detected_lang_id = whisper_code_to_lang_id(detection.language_code) or 0
             lang_match_status = resolve_match_status(current_lang_ids, detected_lang_id)
+
+            # ── Mismatch retry ─────────────────────────────────────────────────
+            retry_confidence = None
+
+            if lang_match_status == "mismatch":
+                logger.info(f"[{event_id}] Mismatch on first pass — starting retry")
+
+                if RETRY_FETCH_DELAY > 0:
+                    time.sleep(RETRY_FETCH_DELAY)
+
+                try:
+                    retry_prefix = f"{event_id}_retry"
+                    retry_ts_files = fetch_segments_retry(
+                        cdn_url,
+                        sample_count=TS_RETRY_SAMPLE_COUNT,
+                        prefix=retry_prefix,
+                    )
+                    retry_wav_path = merge_and_extract_audio(ts_files + retry_ts_files)
+                    retry_detection = detect_language(
+                        retry_wav_path, model_size=model_size
+                    )
+
+                    retry_confidence = retry_detection.confidence
+                    retry_lang_id = (
+                        whisper_code_to_lang_id(retry_detection.language_code) or 0
+                    )
+                    retry_match_status = resolve_match_status(
+                        current_lang_ids, retry_lang_id
+                    )
+
+                    logger.info(
+                        f"[{event_id}] Retry result: {retry_detection.language_name}"
+                        f"({retry_lang_id}) status={retry_match_status} "
+                        f"conf={retry_confidence:.3f}"
+                    )
+
+                    # Retry result wins — overwrite detection fields
+                    detection = retry_detection
+                    detected_lang_id = retry_lang_id
+                    lang_match_status = retry_match_status
+
+                except Exception as retry_exc:
+                    # Retry failed — log and fall through to write the original result
+                    logger.warning(
+                        f"[{event_id}] Retry fetch/detect failed, using first-pass result: {retry_exc}"
+                    )
+            # ──────────────────────────────────────────────────────────────────
 
             write_result(
                 event_id=event_id,
@@ -402,9 +504,10 @@ def process_queue_parallel(
                 detected_lang_id=detected_lang_id,
                 detected_lang_name=detection.language_name,
                 confidence=detection.confidence,
+                retry_confidence=retry_confidence,
                 lang_match_status=lang_match_status,
                 whisper_model=detection.model_used,
-                ts_sampled=len(ts_files),
+                ts_sampled=len(ts_files) + len(retry_ts_files),
                 audio_duration_s=AUDIO_CLIP_SECONDS,
                 status="ok",
             )
@@ -412,9 +515,13 @@ def process_queue_parallel(
             logger.info(
                 f"[{idx}/{total}] DONE event_id={event_id} — "
                 f"{detection.language_name}({detected_lang_id}) "
-                f"conf={detection.confidence:.3f} speech_ratio={speech_ratio:.3f}"
+                f"conf={detection.confidence:.3f}"
+                + (
+                    f" retry_conf={retry_confidence:.3f}"
+                    if retry_confidence is not None
+                    else ""
+                )
             )
-
             return {"event_id": event_id, "status": "ok"}
 
         except Exception as e:
@@ -429,9 +536,11 @@ def process_queue_parallel(
             return {"event_id": event_id, "status": "error", "error": str(e)}
 
         finally:
-            cleanup_ts_files(ts_files)
+            cleanup_ts_files(ts_files + retry_ts_files)  # both lists, one pass
             if wav_path and wav_path.exists():
                 wav_path.unlink(missing_ok=True)
+            if retry_wav_path and retry_wav_path.exists():
+                retry_wav_path.unlink(missing_ok=True)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(worker, row, i) for i, row in enumerate(queue, 1)]
@@ -441,7 +550,7 @@ def process_queue_parallel(
             except Exception as e:
                 logger.error(f"Worker crashed: {e}")
 
-    print("\n✅ Parallel queue processing complete.\n")
+    print("\n Parallel queue processing complete.\n")
 
     processed_ids = [r["event_id"] for r in results if r.get("event_id")]
     mark_processed_bulk(processed_ids)
