@@ -5,7 +5,8 @@ Merges downloaded .ts segments into a single file using FFmpeg,
 then extracts a mono 16 kHz WAV audio clip suitable for Whisper.
 
 VAD (Voice Activity Detection):
-  - Silero VAD model is loaded once and cached (thread-safe, double-checked locking)
+  - Silero VAD model is loaded per-thread using thread-local storage
+  - Each worker thread gets its own model instance — fully thread-safe
   - get_speech_ratio() returns 0.0–1.0 fraction of audio that contains speech
   - Callers should skip Whisper if speech_ratio < 0.15 (music/silent content)
 """
@@ -29,12 +30,7 @@ WHISPER_CHANNELS = 1
 # Speech ratio below this → skip Whisper (music/silence)
 SPEECH_RATIO_THRESHOLD = 0.1
 
-# ── VAD model cache ────────────────────────────────────────────────────────
-
-_vad_model = None
-_vad_utils = None
-_vad_lock = threading.Lock()  # guards loading only (Silero inference is stateless)
-
+_thread_local = threading.local()
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -66,24 +62,14 @@ def merge_and_extract_audio(ts_files: list[Path]) -> Path:
 
 
 def get_speech_ratio(wav_path: Path) -> float:
-    """
-    Returns the fraction of audio that contains speech (0.0–1.0).
-
-    Uses Silero VAD — loaded once and cached across all workers.
-    Returns 0.0 on any failure (safe fallback — caller will skip Whisper).
-
-    Examples:
-        0.00 → music-only or silence  → skip Whisper
-        0.45 → mix of speech + music  → run Whisper
-        0.90 → mostly speech          → run Whisper
-    """
     try:
         model, utils = _get_vad_model()
         read_audio = utils["read_audio"]
         get_speech_timestamps = utils["get_speech_timestamps"]
 
+        model.reset_states()  # reset between calls within same thread
+
         audio = read_audio(str(wav_path), sampling_rate=16000)
-        # Silero get_speech_timestamps is stateless — safe to call concurrently
         timestamps = get_speech_timestamps(audio, model, sampling_rate=16000)
 
         if not timestamps:
@@ -127,31 +113,21 @@ def cleanup_ts_files(ts_files: list[Path]) -> None:
 
 def _get_vad_model():
     """
-    Load Silero VAD once and cache it.
-    Uses the silero-vad package directly (pip install silero-vad).
-    Double-checked locking — only one thread loads even under contention.
+    Load Silero VAD per-thread using thread-local storage.
+    Each worker thread gets its own model instance — fully thread-safe.
     """
-    global _vad_model, _vad_utils
+    if not hasattr(_thread_local, "vad_model"):
+        logger.info(f"Loading Silero VAD for thread {threading.current_thread().name}…")
+        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 
-    # Fast path
-    if _vad_model is not None:
-        return _vad_model, _vad_utils
+        _thread_local.vad_model = load_silero_vad()
+        _thread_local.vad_utils = {
+            "read_audio": read_audio,
+            "get_speech_timestamps": get_speech_timestamps,
+        }
+        logger.info(f"Silero VAD loaded for thread {threading.current_thread().name}.")
 
-    with _vad_lock:
-        # Re-check inside lock
-        if _vad_model is None:
-            logger.info("Loading Silero VAD model…")
-            from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
-
-            _vad_model = load_silero_vad()
-            # Store helpers alongside model as a named dict — no tuple unpacking issues
-            _vad_utils = {
-                "read_audio": read_audio,
-                "get_speech_timestamps": get_speech_timestamps,
-            }
-            logger.info("Silero VAD loaded.")
-
-    return _vad_model, _vad_utils
+    return _thread_local.vad_model, _thread_local.vad_utils
 
 
 # ── FFmpeg internals ───────────────────────────────────────────────────────
