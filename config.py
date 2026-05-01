@@ -37,6 +37,9 @@ WORKER_COUNT = 10
 TS_SAMPLE_COUNT: int = int(os.getenv("TS_SAMPLE_COUNT", 10))
 AUDIO_CLIP_SECONDS: int = 120
 AUDIO_OFFSET_SECONDS: int = 0
+SPEECH_RATIO_THRESHOLD = 0.15
+TS_RETRY_SAMPLE_COUNT = 5  # number of extra segments fetched on mismatch retry
+RETRY_FETCH_DELAY = 2  # seconds to wait before retry CDN fetch (0 = no delay)
 
 # ── Networking ─────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT: int = 30

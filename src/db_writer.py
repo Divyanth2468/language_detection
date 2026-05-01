@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS detection_results (
     detected_lang_id     INT,
     detected_lang_name   VARCHAR(64),
     confidence           FLOAT,
+    retry_confidence     FLOAT NULL DEFAULT NULL,
     lang_match_status    VARCHAR(20),
     whisper_model        VARCHAR(20),
     ts_sampled           INT,
@@ -111,12 +112,13 @@ def get_queue() -> list[dict]:
 def write_result(
     event_id: str,
     cdn_url: str = "",
-    current_lang_ids: list = None,
+    current_lang_ids: list | None = None,
     current_lang_names: str = "",
     detected_lang: str = "",
-    detected_lang_id: int = None,
+    detected_lang_id: int | None = None,  # ← was: int = None
     detected_lang_name: str = "",
     confidence: float = 0.0,
+    retry_confidence: float | None = None,  # ← was: float = None
     lang_match_status: str = "",
     whisper_model: str = "",
     ts_sampled: int = 0,
@@ -131,12 +133,12 @@ def write_result(
             INSERT INTO detection_results (
                 event_id, cdn_url, current_lang_ids, current_lang_names,
                 detected_lang, detected_lang_id, detected_lang_name,
-                confidence, lang_match_status, whisper_model,
+                confidence, retry_confidence, lang_match_status, whisper_model,
                 ts_sampled, audio_duration_s, status, error, processed_at
             ) VALUES (
                 %(event_id)s, %(cdn_url)s, %(current_lang_ids)s, %(current_lang_names)s,
                 %(detected_lang)s, %(detected_lang_id)s, %(detected_lang_name)s,
-                %(confidence)s, %(lang_match_status)s, %(whisper_model)s,
+                %(confidence)s, %(retry_confidence)s, %(lang_match_status)s, %(whisper_model)s,
                 %(ts_sampled)s, %(audio_duration_s)s, %(status)s, %(error)s, %(processed_at)s
             )
             ON DUPLICATE KEY UPDATE
@@ -147,6 +149,7 @@ def write_result(
                 detected_lang_id   = VALUES(detected_lang_id),
                 detected_lang_name = VALUES(detected_lang_name),
                 confidence         = VALUES(confidence),
+                retry_confidence   = VALUES(retry_confidence),
                 lang_match_status  = VALUES(lang_match_status),
                 whisper_model      = VALUES(whisper_model),
                 ts_sampled         = VALUES(ts_sampled),
@@ -164,6 +167,9 @@ def write_result(
                 "detected_lang_id": detected_lang_id,
                 "detected_lang_name": detected_lang_name,
                 "confidence": round(confidence, 4),
+                "retry_confidence": (
+                    round(retry_confidence, 4) if retry_confidence is not None else None
+                ),
                 "lang_match_status": lang_match_status,
                 "whisper_model": whisper_model,
                 "ts_sampled": ts_sampled,
@@ -177,6 +183,11 @@ def write_result(
         f"DB write OK — event_id={event_id} "
         f"detected={detected_lang_name}({detected_lang_id}) "
         f"status={lang_match_status} conf={confidence:.3f}"
+        + (
+            f" retry_conf={retry_confidence:.3f}"
+            if retry_confidence is not None
+            else ""
+        )
     )
 
 
@@ -248,6 +259,7 @@ def export_mismatched_to_csv(output_path: Path):
         detected_lang_id,
         detected_lang_name,
         confidence,
+        retry_confidence,
         lang_match_status,
         whisper_model,
         ts_sampled,
@@ -263,17 +275,23 @@ def export_mismatched_to_csv(output_path: Path):
     with _cursor() as cur:
         cur.execute(query)
         rows = cur.fetchall()
+
     if not rows:
         print("No mismatched rows found.")
         return
 
-    fieldnames = list(rows[0].keys()) + ["video_link"]
+    fieldnames = [k for k in rows[0].keys() if k != "retry_confidence"] + ["video_link"]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             row = dict(row)
+
+            # Use the stronger confidence signal
+            conf = row.get("confidence") or 0.0
+            retry_conf = row.get("retry_confidence")
+            row["confidence"] = retry_conf if retry_conf is not None else conf
             try:
                 row["video_link"] = _encrypt_video_url(row["event_id"])
             except (ValueError, KeyError):

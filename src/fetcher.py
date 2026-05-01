@@ -139,8 +139,8 @@ def _pick_best_variant(playlist: m3u8.M3U8, base_url: str) -> str:
 
 def _spaced_sample(items: list, n: int) -> list:
     """
-    Return `n` items evenly distributed across `items`.
-    Falls back to random.sample if n >= len(items).
+    Return `n` items evenly distributed across the middle 50% of `items`.
+    Fully deterministic — no randomness.
     """
     start = len(items) // 4
     end = (len(items) * 3) // 4
@@ -149,18 +149,13 @@ def _spaced_sample(items: list, n: int) -> list:
     if n >= len(items):
         return items[:]
 
+    # Pick one item per bucket at the bucket midpoint (deterministic)
     bucket_size = len(items) / n
     result = []
-
     for i in range(n):
-        start = int(i * bucket_size)
-        end = int((i + 1) * bucket_size)
-
-        bucket = items[start:end]
-        if not bucket:
-            bucket = items  # fallback
-
-        result.append(random.choice(bucket))
+        mid = int((i + 0.5) * bucket_size)  # midpoint of bucket
+        mid = min(mid, len(items) - 1)
+        result.append(items[mid])
     return result
 
 
@@ -224,3 +219,81 @@ def _url_filename(url: str) -> str:
     # Keep only safe characters
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
     return safe[:80]  # cap length
+
+
+def fetch_segments_retry(
+    m3u8_url: str,
+    sample_count: int,
+    prefix: str,
+) -> list[Path]:
+    """
+    Fetch additional segments for mismatch retry.
+    Samples from the 15-25% and 75-85% bands of the playlist,
+    guaranteed not to overlap with the middle-50% window used
+    by the first-pass fetch_segments().
+    """
+    if not prefix:
+        raise ValueError("prefix is required")
+
+    logger.info(f"Retry fetch: {m3u8_url} (prefix={prefix}, count={sample_count})")
+
+    segment_urls = _get_segment_urls(m3u8_url)
+    if not segment_urls:
+        raise RuntimeError(f"No TS segments found in playlist: {m3u8_url}")
+
+    sampled = _retry_spaced_sample(segment_urls, sample_count)
+
+    temp_downloaded: list[Path | None] = [None] * len(sampled)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(_download_segment, url, i, prefix): i - 1
+            for i, url in enumerate(sampled, 1)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                temp_downloaded[idx] = future.result()
+            except Exception as exc:
+                logger.warning(f"[retry segment {idx+1}] download failed: {exc}")
+
+    if not any(temp_downloaded):
+        raise RuntimeError("All retry segment downloads failed.")
+
+    downloaded = [d for d in temp_downloaded if d is not None]
+    logger.info(f"Retry: downloaded {len(downloaded)} segments (prefix={prefix})")
+    return downloaded
+
+
+def _retry_spaced_sample(items: list, n: int) -> list:
+    """
+    Sample evenly from the 15-25% band and the 75-85% band of the playlist.
+    Splits n as evenly as possible between the two bands.
+    """
+    total = len(items)
+
+    lo_start = int(total * 0.15)
+    lo_end = int(total * 0.25)
+    hi_start = int(total * 0.75)
+    hi_end = int(total * 0.85)
+
+    lo_band = items[lo_start:lo_end]
+    hi_band = items[hi_start:hi_end]
+
+    n_lo = n // 2
+    n_hi = n - n_lo  # hi gets the extra 1 if n is odd
+
+    def _pick(band, k):
+        if not band:
+            return []
+        if k >= len(band):
+            return band[:]
+        bucket_size = len(band) / k
+        return [
+            random.choice(
+                band[int(i * bucket_size) : int((i + 1) * bucket_size)] or band
+            )
+            for i in range(k)
+        ]
+
+    return _pick(lo_band, n_lo) + _pick(hi_band, n_hi)

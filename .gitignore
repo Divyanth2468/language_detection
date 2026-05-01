@@ -37,4 +37,4 @@ Thumbs.db
 *.sqlite3
 
 pyrightconfig.json
-
+print_code.sh

@@ -3,12 +3,11 @@
 export_csv.py
 ─────────────
 Reads detection_results from DB and exports to CSV.
-This is the only script that touches the filesystem for CSV output.
 
 Usage:
     python export_csv.py --output output/results.csv
-    python export_csv.py --output output/results.csv --from 2026-01-01 --to 2026-03-31
-    python export_csv.py --output output/results.csv --status mismatch
+    python export_csv.py --output output/results.csv --min-confidence 0.7
+    python export_csv.py --output output/results.csv --max-confidence 0.7
 """
 
 import argparse
@@ -16,10 +15,10 @@ import csv
 import json
 import logging
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from src.db import _cursor, test_connection
+from src.db_writer import _encrypt_video_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,50 +27,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger("export_csv")
 
-# Final CSV column order for the Go dashboard
+
+# EXACT columns (no processed_at, no id)
 CSV_COLUMNS = [
     "event_id",
     "cdn_url",
-    "current_lang_ids",       # raw  e.g. [7, 22]
-    "current_lang_names",     # expanded e.g. "Hindi, Telugu"
-    "detected_lang",          # ISO code e.g. "hi"
-    "detected_lang_id",       # your DB ID e.g. 7
-    "detected_lang_name",     # human name e.g. "Hindi"
+    "current_lang_ids",
+    "current_lang_names",
+    "detected_lang",
+    "detected_lang_id",
+    "detected_lang_name",
     "confidence",
-    "lang_match_status",      # match | dialect_match | mismatch | untagged | unmapped
+    "lang_match_status",
     "whisper_model",
     "ts_sampled",
     "audio_duration_s",
     "status",
     "error",
-    "processed_at",
+    "video_link",
 ]
 
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Export detection_results to CSV.")
-    p.add_argument("--output", "-o", required=True, type=Path,
-                   help="Path to write CSV e.g. output/results.csv")
-    p.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD",
-                   help="Filter by processed_at start date.")
-    p.add_argument("--to", dest="to_date", metavar="YYYY-MM-DD",
-                   help="Filter by processed_at end date.")
-    p.add_argument("--status", choices=["ok", "error", "mismatch", "match",
-                                         "dialect_match", "untagged", "unmapped"],
-                   help="Filter by lang_match_status or status.")
+    p.add_argument("--output", "-o", required=True, type=Path)
+
+    p.add_argument("--from", dest="from_date")
+    p.add_argument("--to", dest="to_date")
+
+    p.add_argument(
+        "--status",
+        choices=[
+            "ok",
+            "error",
+            "mismatch",
+            "match",
+            "dialect_match",
+            "untagged",
+            "unmapped",
+        ],
+    )
+
+    # Confidence filters
+    p.add_argument("--min-confidence", type=float, help="confidence >= value")
+    p.add_argument("--max-confidence", type=float, help="confidence < value")
+
     return p.parse_args()
 
 
-def fetch_results(from_date=None, to_date=None, status_filter=None) -> list[dict]:
+def fetch_results(
+    from_date=None, to_date=None, status_filter=None, min_conf=None, max_conf=None
+):
+
     conditions = ["1=1"]
     params = {}
 
     if from_date:
         conditions.append("processed_at >= %(from_date)s")
         params["from_date"] = from_date
+
     if to_date:
         conditions.append("processed_at <= %(to_date)s")
         params["to_date"] = to_date + " 23:59:59"
+
     if status_filter:
         if status_filter in ("ok", "error"):
             conditions.append("status = %(sf)s")
@@ -79,16 +97,38 @@ def fetch_results(from_date=None, to_date=None, status_filter=None) -> list[dict
             conditions.append("lang_match_status = %(sf)s")
         params["sf"] = status_filter
 
+    if min_conf is not None:
+        conditions.append(
+            "GREATEST(confidence, COALESCE(retry_confidence, 0)) >= %(min_conf)s"
+        )
+        params["min_conf"] = min_conf
+
+    if max_conf is not None:
+        conditions.append(
+            "GREATEST(confidence, COALESCE(retry_confidence, 0)) < %(max_conf)s"
+        )
+        params["max_conf"] = max_conf
+
     query = f"""
         SELECT
-            event_id, cdn_url,
-            current_lang_ids, current_lang_names,
-            detected_lang, detected_lang_id, detected_lang_name,
-            confidence, lang_match_status, whisper_model,
-            ts_sampled, audio_duration_s, status, error, processed_at
+            event_id,
+            cdn_url,
+            current_lang_ids,
+            current_lang_names,
+            detected_lang,
+            detected_lang_id,
+            detected_lang_name,
+            confidence,
+            retry_confidence,
+            lang_match_status,
+            whisper_model,
+            ts_sampled,
+            audio_duration_s,
+            status,
+            error
         FROM detection_results
         WHERE {' AND '.join(conditions)}
-        ORDER BY processed_at ASC
+        ORDER BY event_id ASC
     """
 
     with _cursor() as cur:
@@ -100,17 +140,19 @@ def main():
     args = _parse_args()
 
     if not test_connection():
-        print("Cannot connect to DB. Check DB_* in .env")
+        print("Cannot connect to DB.")
         sys.exit(1)
 
     rows = fetch_results(
-        from_date     = args.from_date,
-        to_date       = args.to_date,
-        status_filter = args.status,
+        from_date=args.from_date,
+        to_date=args.to_date,
+        status_filter=args.status,
+        min_conf=args.min_confidence,
+        max_conf=args.max_confidence,
     )
 
     if not rows:
-        print("No results found for given filters.")
+        print("No results found.")
         sys.exit(0)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -118,8 +160,9 @@ def main():
     with open(args.output, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
+
         for row in rows:
-            # Normalize current_lang_ids from JSON string to readable form
+            # Normalize JSON
             raw = row.get("current_lang_ids")
             if isinstance(raw, str):
                 try:
@@ -128,25 +171,20 @@ def main():
                     pass
             elif isinstance(raw, list):
                 row["current_lang_ids"] = json.dumps(raw)
+
+            # Use the stronger confidence signal for the CSV output
+            conf = row.get("confidence") or 0.0
+            retry_conf = row.get("retry_confidence")
+            row["confidence"] = retry_conf if retry_conf is not None else conf
+
+            try:
+                row["video_link"] = _encrypt_video_url(row["event_id"])
+            except Exception:
+                row["video_link"] = ""
+
             writer.writerow(row)
 
-    print(f"\n✅  Exported {len(rows)} rows → {args.output}\n")
-
-    # Quick summary
-    ok       = sum(1 for r in rows if r.get("status") == "ok")
-    match    = sum(1 for r in rows if r.get("lang_match_status") == "match")
-    dialect  = sum(1 for r in rows if r.get("lang_match_status") == "dialect_match")
-    mismatch = sum(1 for r in rows if r.get("lang_match_status") == "mismatch")
-    untagged = sum(1 for r in rows if r.get("lang_match_status") == "untagged")
-    errors   = sum(1 for r in rows if r.get("status") == "error")
-
-    print(f"  Total        : {len(rows)}")
-    print(f"  Successful   : {ok}")
-    print(f"  Errors       : {errors}")
-    print(f"  Match        : {match}")
-    print(f"  Dialect match: {dialect}")
-    print(f"  Mismatch     : {mismatch}")
-    print(f"  Untagged     : {untagged}\n")
+    print(f"\nExported {len(rows)} rows → {args.output}\n")
 
 
 if __name__ == "__main__":

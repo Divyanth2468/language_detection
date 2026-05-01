@@ -3,6 +3,10 @@ src/detector.py
 ───────────────
 Loads a Whisper model (lazily, cached across calls) and detects
 the spoken language in a WAV file.
+
+Thread safety:
+  - _model_lock  : ensures only one thread loads the model
+  - _infer_lock  : serializes inference across workers (model is not thread-safe)
 """
 
 import logging
@@ -27,9 +31,12 @@ from config import LANGUAGE_NAMES, WHISPER_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Module-level cache so the model loads only once per process
+# ── Model cache ────────────────────────────────────────────────────────────
+
 _whisper_model = None
 _whisper_model_size = None
+_model_lock = threading.Lock()  # guards model loading
+_infer_lock = threading.Lock()  # guards inference (model not thread-safe)
 
 
 @dataclass
@@ -50,6 +57,9 @@ def detect_language(wav_path: Path, model_size: str = WHISPER_MODEL) -> Detectio
     Uses Whisper's `detect_language()` which runs on the first 30 s
     of audio — very fast even for large models.
 
+    Thread-safe: model loading and inference are each protected by
+    their own lock so multiple workers share one model safely.
+
     Returns a DetectionResult.
     Raises RuntimeError on model or file errors.
     """
@@ -61,17 +71,18 @@ def detect_language(wav_path: Path, model_size: str = WHISPER_MODEL) -> Detectio
     logger.info(f"Detecting language in {wav_path.name} (model={model_size})")
 
     # Load and pad/trim audio to 30 s (Whisper's window)
+    # Audio loading is file I/O — fine to do outside the lock
     audio = whisper.load_audio(str(wav_path))
     audio = whisper.pad_or_trim(audio)
 
-    # Compute log-Mel spectrogram on the correct device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mel = whisper.log_mel_spectrogram(audio).to(device)
 
-    # detect_language returns (language_token, probabilities_dict)
-    _, probs = model.detect_language(mel)
+    # Serialize inference — Whisper model object is not thread-safe
+    with _infer_lock:
+        _, probs = model.detect_language(mel)
 
-    # Top-1 result
+    # Top-1 result (outside lock — just dict ops)
     lang_code = max(probs, key=probs.get)
     confidence = float(probs[lang_code])
     lang_name = LANGUAGE_NAMES.get(lang_code, lang_code.upper())
@@ -88,22 +99,24 @@ def detect_language(wav_path: Path, model_size: str = WHISPER_MODEL) -> Detectio
 
 # ── Internals ──────────────────────────────────────────────────────────────
 
-_whisper_model = None
-_whisper_model_size = None
-_model_lock = threading.Lock()
-
 
 def _get_model(model_size: str):
+    """
+    Load Whisper model once and cache it.
+    Double-checked locking ensures only one thread loads even under contention.
+    """
     global _whisper_model, _whisper_model_size
 
-    if _whisper_model is None or _whisper_model_size != model_size:
-        with _model_lock:  # ensures only one thread loads
-            if _whisper_model is None or _whisper_model_size != model_size:
-                import whisper
+    # Fast path — no lock needed if already loaded
+    if _whisper_model is not None and _whisper_model_size == model_size:
+        return _whisper_model
 
-                logger.info(f"Loading Whisper model: '{model_size}' …")
-                _whisper_model = whisper.load_model(model_size)
-                _whisper_model_size = model_size
-                logger.info("Model loaded.")
+    with _model_lock:
+        # Re-check inside lock — another thread may have loaded while we waited
+        if _whisper_model is None or _whisper_model_size != model_size:
+            logger.info(f"Loading Whisper model: '{model_size}' …")
+            _whisper_model = whisper.load_model(model_size)
+            _whisper_model_size = model_size
+            logger.info("Whisper model loaded.")
 
     return _whisper_model
